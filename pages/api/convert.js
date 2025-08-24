@@ -1,37 +1,65 @@
+import formidable from "formidable";
+import fs from "fs";
+import CloudConvert from "cloudconvert";
+
 export const config = {
-  api: { bodyParser: false },
+  api: {
+    bodyParser: false,
+  },
 };
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-
-  // Dynamically import Node-only modules
-  const formidable = (await import("formidable")).default;
-  const fs = await import("fs");
-  const fetch = (await import("node-fetch")).default;
+  if (req.method !== "POST") {
+    res.status(405).json({ error: "Method not allowed" });
+    return;
+  }
 
   const form = new formidable.IncomingForm();
 
   form.parse(req, async (err, fields, files) => {
     if (err) return res.status(500).json({ error: "Upload error" });
 
-    const fileStream = fs.createReadStream(files.file.filepath);
+    const file = files.file;
+    if (!file) return res.status(400).json({ error: "No file uploaded" });
 
-    const ext = files.file.originalFilename.split(".").pop().toLowerCase();
-    const direction = ext === "pdf" ? "pdf/to/docx" : "docx/to/pdf";
-    const mime = ext === "pdf"
-      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-      : "application/pdf";
+    const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY);
 
-    const resApi = await fetch(
-      `https://v2.convertapi.com/convert/${direction}?Secret=${process.env.CONVERT_API_KEY}`,
-      { method: "POST", body: fileStream }
-    );
+    try {
+      // 1️⃣ Upload file to CloudConvert
+      const uploadTask = await cloudConvert.tasks.create({
+        name: "import-my-file",
+        operation: "import/upload",
+      });
 
-    if (!resApi.ok) return res.status(500).json({ error: "Conversion failed" });
+      const fileData = fs.createReadStream(file.filepath);
+      await cloudConvert.tasks.upload(uploadTask, fileData, file.originalFilename);
 
-    const buffer = await resApi.buffer();
-    res.setHeader("Content-Type", mime);
-    res.send(buffer);
+      // 2️⃣ Convert to PDF
+      const convertTask = await cloudConvert.tasks.create({
+        name: "convert-my-file",
+        operation: "convert",
+        input: uploadTask.id,
+        output_format: "pdf",
+      });
+
+      // 3️⃣ Export file
+      const exportTask = await cloudConvert.tasks.create({
+        name: "export-my-file",
+        operation: "export/url",
+        input: convertTask.id,
+      });
+
+      // Wait for completion
+      const completed = await cloudConvert.jobs.wait(exportTask.id);
+
+      const fileUrl = completed.tasks.find((t) => t.name === "export-my-file")?.result?.files[0]?.url;
+
+      if (!fileUrl) throw new Error("Conversion failed");
+
+      res.status(200).json({ url: fileUrl });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Conversion failed" });
+    }
   });
 }
